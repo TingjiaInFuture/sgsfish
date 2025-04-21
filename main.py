@@ -45,7 +45,7 @@ def run_test_scenario():
                    current_hp=my_current_hp)
 
     # 从数据库获取卡牌实例 (手牌内容作为场景输入)
-    my_hand_names = ["杀", "过河拆桥"]
+    my_hand_names = ["过河拆桥", "杀", "顺手牵羊"] # 添加顺手牵羊到手牌
     my_hand_cards = [get_card_instance(name) for name in my_hand_names]
     me = Player(name="玩家1", hero=my_hero, hand=my_hand_cards)
 

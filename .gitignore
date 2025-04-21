@@ -3,6 +3,7 @@ target/
 !**/src/main/**/target/
 !**/src/test/**/target/
 __pycache__
+sgs_data.db
 
 ### IntelliJ IDEA ###
 .idea/modules.xml

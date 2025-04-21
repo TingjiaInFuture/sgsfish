@@ -1,6 +1,7 @@
 import sqlite3
 import json
 from typing import Dict, Any, List, Tuple, Optional
+import os # 导入 os 模块
 
 DB_PATH = 'sgs_data.db'
 
@@ -59,11 +60,13 @@ def populate_initial_data():
     cards_data = [
         ('杀', 1.0, 0.0, 0.0),
         ('过河拆桥', 0.0, 0.0, 1.0),
+        ('顺手牵羊', 0.0, 0.0, 1.0),
     ]
 
     influences_data = [
-        # 过河拆桥影响杀：攻击+1
         ('过河拆桥', '杀', 1.0, 0.0, 0.0),
+        ('过河拆桥', '顺手牵羊', 0.0, 0.0, 1.0),
+        ('顺手牵羊', '杀', 1.0, 0.0, 0.0),
     ]
 
     heroes_data = [
@@ -72,22 +75,29 @@ def populate_initial_data():
     ]
 
     try:
+        print("Inserting cards...")
         cursor.executemany('INSERT OR IGNORE INTO cards (name, attack, defense, support) VALUES (?, ?, ?, ?)', cards_data)
-        cursor.executemany('INSERT OR IGNORE INTO heroes (name, max_hp) VALUES (?, ?)', heroes_data) # 使用 IGNORE 避免重复插入
-        # 注意：影响数据通常不应该用 IGNORE，除非确定不会有重复且重要的影响
+        print("Cards inserted.")
+
+        print("Inserting heroes...")
+        cursor.executemany('INSERT OR IGNORE INTO heroes (name, max_hp) VALUES (?, ?)', heroes_data)
+        print("Heroes inserted.")
+
+        print("Inserting influences...")
+        # Ensure the target columns exactly match the number of values in the tuples
         cursor.executemany('INSERT INTO card_influences (source_card_name, target_card_name, attack_modifier, defense_modifier, support_modifier) VALUES (?, ?, ?, ?, ?)', influences_data)
+        print("Influences inserted.")
 
         conn.commit()
-        print("初始卡牌、英雄和影响数据已填充。")
-    except sqlite3.IntegrityError as e:
-        # 如果是因为 IGNORE 跳过了，这里可能不会触发，但保留以防其他约束
-        print(f"填充数据时出错 (可能部分数据已存在): {e}")
-    except sqlite3.Error as e:
-        print(f"填充数据时发生数据库错误: {e}")
+        print("初始卡牌、英雄和影响数据已填充/更新。")
+    except sqlite3.Error as e: # Catch specific SQLite errors
+        print(f"填充数据时发生数据库错误: {e}") # Print the specific error
+        conn.rollback() # Rollback on error
+    except Exception as e: # Catch any other unexpected errors
+        print(f"填充数据时发生未知错误: {e}")
         conn.rollback()
     finally:
         conn.close()
-
 
 def load_cards_from_db() -> Dict[str, Any]:
     """从数据库加载所有卡牌及其影响"""
@@ -138,14 +148,34 @@ def load_hero_template(name: str) -> Optional[Dict[str, Any]]:
     return None
 
 if __name__ == '__main__':
+    # --- 确保测试/初始化时的干净状态 ---
+    if os.path.exists(DB_PATH):
+        print(f"删除旧数据库文件: {DB_PATH}")
+        try:
+            os.remove(DB_PATH)
+            print("旧数据库文件已删除。")
+        except OSError as e:
+            print(f"错误：无法删除数据库文件 {DB_PATH}: {e}")
+            # 根据需要决定是否继续
+            # return
+    # --- 结束干净状态 ---
+
     # 作为脚本运行时，初始化并填充数据库
-    initialize_database()
-    populate_initial_data()
+    print("正在初始化数据库...")
+    initialize_database() # 这会创建新表
+    print("正在填充初始数据...")
+    populate_initial_data() # 这会向新表中插入数据
+
     # 测试加载
-    loaded_cards = load_cards_from_db()
-    print("\n加载的卡牌数据示例:")
-    import pprint
-    pprint.pprint(loaded_cards)
-    hero1_template = load_hero_template('白板1')
-    print("\n加载的英雄模板示例:")
-    pprint.pprint(hero1_template)
+    print("\n--- 测试加载数据 ---")
+    try:
+        loaded_cards = load_cards_from_db()
+        print("\n加载的卡牌数据示例:")
+        import pprint
+        pprint.pprint(loaded_cards)
+        hero1_template = load_hero_template('白板1')
+        print("\n加载的英雄模板示例:")
+        pprint.pprint(hero1_template)
+    except Exception as e:
+        print(f"\n测试加载时出错: {e}")
+    print("-" * 20)
