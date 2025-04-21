@@ -1,6 +1,6 @@
 import sqlite3
 import json
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 DB_PATH = 'sgs_data.db'
 
@@ -38,12 +38,21 @@ def initialize_database():
     )
     ''')
 
+    # 创建 heroes 表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS heroes (
+        name TEXT PRIMARY KEY,
+        max_hp INTEGER NOT NULL
+        -- 可以添加其他英雄基础属性，如势力、初始技能等
+    )
+    ''')
+
     conn.commit()
     conn.close()
     print("数据库表已初始化。")
 
 def populate_initial_data():
-    """填充初始卡牌和影响数据"""
+    """填充初始卡牌、影响和英雄数据"""
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -57,13 +66,22 @@ def populate_initial_data():
         ('过河拆桥', '杀', 1.0, 0.0, 0.0),
     ]
 
+    heroes_data = [
+        ('白板1', 4),
+        ('白板2', 4),
+    ]
+
     try:
         cursor.executemany('INSERT OR IGNORE INTO cards (name, attack, defense, support) VALUES (?, ?, ?, ?)', cards_data)
+        cursor.executemany('INSERT OR IGNORE INTO heroes (name, max_hp) VALUES (?, ?)', heroes_data) # 使用 IGNORE 避免重复插入
+        # 注意：影响数据通常不应该用 IGNORE，除非确定不会有重复且重要的影响
         cursor.executemany('INSERT INTO card_influences (source_card_name, target_card_name, attack_modifier, defense_modifier, support_modifier) VALUES (?, ?, ?, ?, ?)', influences_data)
+
         conn.commit()
-        print("初始卡牌和影响数据已填充。")
+        print("初始卡牌、英雄和影响数据已填充。")
     except sqlite3.IntegrityError as e:
-        print(f"填充数据时出错 (可能已存在): {e}") # 避免重复插入时报错
+        # 如果是因为 IGNORE 跳过了，这里可能不会触发，但保留以防其他约束
+        print(f"填充数据时出错 (可能部分数据已存在): {e}")
     except sqlite3.Error as e:
         print(f"填充数据时发生数据库错误: {e}")
         conn.rollback()
@@ -108,6 +126,17 @@ def load_cards_from_db() -> Dict[str, Any]:
     print(f"从数据库加载了 {len(cards)} 种卡牌。")
     return cards
 
+def load_hero_template(name: str) -> Optional[Dict[str, Any]]:
+    """从数据库加载指定名称的英雄模板数据"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT name, max_hp FROM heroes WHERE name = ?', (name,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return None
+
 if __name__ == '__main__':
     # 作为脚本运行时，初始化并填充数据库
     initialize_database()
@@ -117,3 +146,6 @@ if __name__ == '__main__':
     print("\n加载的卡牌数据示例:")
     import pprint
     pprint.pprint(loaded_cards)
+    hero1_template = load_hero_template('白板1')
+    print("\n加载的英雄模板示例:")
+    pprint.pprint(hero1_template)
