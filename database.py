@@ -1,7 +1,8 @@
 import sqlite3
 import json
 from typing import Dict, Any, List, Tuple, Optional
-import os # 导入 os 模块
+import os
+from collections import defaultdict # Import defaultdict
 
 DB_PATH = 'sgs_data.db'
 
@@ -12,61 +13,74 @@ def get_db_connection():
     return conn
 
 def initialize_database():
-    """初始化数据库表"""
+    """初始化数据库表，支持 ActionEntity 的 scope 和 influence 的 required_scope"""
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 创建 cards 表
+    # 更新 entities 表，添加 scope 列 (存储 JSON 列表)
     cursor.execute('''
-    CREATE TABLE IF NOT EXISTS cards (
+    CREATE TABLE IF NOT EXISTS entities (
         name TEXT PRIMARY KEY,
         attack REAL DEFAULT 0.0,
         defense REAL DEFAULT 0.0,
-        support REAL DEFAULT 0.0
+        support REAL DEFAULT 0.0,
+        timing INTEGER,
+        response_suit INTEGER,
+        response_rank_start INTEGER,
+        response_rank_end INTEGER,
+        scope TEXT -- 新增: 可选作用域 (存储为 JSON 字符串, e.g., '[1, 2, 3]')
     )
     ''')
 
-    # 创建 card_influences 表
+    # 更新 entity_influences 表，添加 required_scope 列
     cursor.execute('''
-    CREATE TABLE IF NOT EXISTS card_influences (
+    CREATE TABLE IF NOT EXISTS entity_influences (
         influence_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        source_card_name TEXT NOT NULL,
-        target_card_name TEXT NOT NULL,
+        source_entity_name TEXT NOT NULL,
+        target_entity_name TEXT NOT NULL,
         attack_modifier REAL DEFAULT 0.0,
         defense_modifier REAL DEFAULT 0.0,
         support_modifier REAL DEFAULT 0.0,
-        FOREIGN KEY (source_card_name) REFERENCES cards (name)
+        required_scope INTEGER, -- 新增: 影响生效所需的作用域
+        FOREIGN KEY (source_entity_name) REFERENCES entities (name)
     )
     ''')
 
-    # 创建 heroes 表
+    # heroes 表保持不变
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS heroes (
         name TEXT PRIMARY KEY,
         max_hp INTEGER NOT NULL
-        -- 可以添加其他英雄基础属性，如势力、初始技能等
     )
     ''')
 
     conn.commit()
     conn.close()
-    print("数据库表已初始化。")
+    print("数据库表已初始化/更新。")
 
 def populate_initial_data():
-    """填充初始卡牌、影响和英雄数据"""
+    """填充初始数据，包含 scope 和 required_scope"""
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cards_data = [
-        ('杀', 1.0, 0.0, 0.0),
-        ('过河拆桥', 0.0, 0.0, 1.0),
-        ('顺手牵羊', 0.0, 0.0, 1.0),
+    # (name, attack, defense, support, timing, response_suit, response_rank_start, response_rank_end, scope_json)
+    entities_data = [
+        ('杀', 1.0, 0.0, 0.0, 0, None, None, None, None), # 无特定可选作用域
+        ('过河拆桥', 0.0, 0.0, 1.0, 0, None, None, None, json.dumps([1, 2, 3])), # 可选手牌(1), 装备(2), 判定(3)
+        ('顺手牵羊', 0.0, 0.0, 1.0, 0, None, None, None, json.dumps([1, 2])), # 可选手牌(1), 装备(2)
+        ('闪电', 0.0, 0.0, 0.0, 2, 1, 2, 9, None), # 判定牌，无可选作用域
+        ('闪', 0.0, 1.0, 0.0, None, None, None, None, None), # 响应牌
+        ('桃', 0.0, 0.0, 1.0, 0, None, None, None, None), # 出牌阶段可用
     ]
 
+    # (source, target, atk_mod, def_mod, sup_mod, required_scope)
     influences_data = [
-        ('过河拆桥', '杀', 1.0, 0.0, 0.0),
-        ('过河拆桥', '顺手牵羊', 0.0, 0.0, 1.0),
-        ('顺手牵羊', '杀', 1.0, 0.0, 0.0),
+        # 过拆作用于手牌(1)时，增加后续杀的攻击
+        ('过河拆桥', '杀', 1.0, 0.0, 0.0, 1),
+        # 过拆作用于装备区(2)时，增加后续顺手的辅助
+        ('过河拆桥', '顺手牵羊', 0.0, 0.0, 1.0, 2),
+        # 顺手作用于手牌(1)时，增加后续杀的攻击
+        ('顺手牵羊', '杀', 1.0, 0.0, 0.0, 1),
     ]
 
     heroes_data = [
@@ -75,66 +89,74 @@ def populate_initial_data():
     ]
 
     try:
-        print("Inserting cards...")
-        cursor.executemany('INSERT OR IGNORE INTO cards (name, attack, defense, support) VALUES (?, ?, ?, ?)', cards_data)
-        print("Cards inserted.")
+        print("Inserting entities...")
+        cursor.executemany('INSERT OR IGNORE INTO entities (name, attack, defense, support, timing, response_suit, response_rank_start, response_rank_end, scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', entities_data)
+        print("Entities inserted.")
 
         print("Inserting heroes...")
         cursor.executemany('INSERT OR IGNORE INTO heroes (name, max_hp) VALUES (?, ?)', heroes_data)
         print("Heroes inserted.")
 
         print("Inserting influences...")
-        # Ensure the target columns exactly match the number of values in the tuples
-        cursor.executemany('INSERT INTO card_influences (source_card_name, target_card_name, attack_modifier, defense_modifier, support_modifier) VALUES (?, ?, ?, ?, ?)', influences_data)
+        cursor.executemany('INSERT INTO entity_influences (source_entity_name, target_entity_name, attack_modifier, defense_modifier, support_modifier, required_scope) VALUES (?, ?, ?, ?, ?, ?)', influences_data)
         print("Influences inserted.")
 
         conn.commit()
-        print("初始卡牌、英雄和影响数据已填充/更新。")
-    except sqlite3.Error as e: # Catch specific SQLite errors
-        print(f"填充数据时发生数据库错误: {e}") # Print the specific error
-        conn.rollback() # Rollback on error
-    except Exception as e: # Catch any other unexpected errors
+        print("初始实体、英雄和影响数据已填充/更新。")
+    except sqlite3.Error as e:
+        print(f"填充数据时发生数据库错误: {e}")
+        conn.rollback()
+    except Exception as e:
         print(f"填充数据时发生未知错误: {e}")
         conn.rollback()
     finally:
         conn.close()
 
-def load_cards_from_db() -> Dict[str, Any]:
-    """从数据库加载所有卡牌及其影响"""
-    cards = {}
+def load_entities_from_db() -> Dict[str, Any]:
+    """从数据库加载所有实体及其影响 (包含 scope 和 required_scope)"""
+    entities = {}
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 加载卡牌基础属性
-    cursor.execute('SELECT name, attack, defense, support FROM cards')
-    card_rows = cursor.fetchall()
-    for row in card_rows:
-        cards[row['name']] = {
+    # 加载实体基础属性、状态和 scope
+    cursor.execute('SELECT name, attack, defense, support, timing, response_suit, response_rank_start, response_rank_end, scope FROM entities')
+    entity_rows = cursor.fetchall()
+    for row in entity_rows:
+        entities[row['name']] = {
             'attributes': {'attack': row['attack'], 'defense': row['defense'], 'support': row['support']},
-            'influences': {} # 初始化影响字典
+            'influences': defaultdict(list), # 初始化影响字典 (使用 defaultdict)
+            'timing': row['timing'],
+            'response_suit': row['response_suit'],
+            'response_rank_start': row['response_rank_start'],
+            'response_rank_end': row['response_rank_end'],
+            'scope': row['scope'] # Load scope as JSON string initially
         }
 
-    # 加载影响
+    # 加载影响，包含 required_scope
     cursor.execute('''
-        SELECT source_card_name, target_card_name, attack_modifier, defense_modifier, support_modifier
-        FROM card_influences
+        SELECT source_entity_name, target_entity_name, attack_modifier, defense_modifier, support_modifier, required_scope
+        FROM entity_influences
     ''')
     influence_rows = cursor.fetchall()
     for row in influence_rows:
-        source_name = row['source_card_name']
-        target_name = row['target_card_name']
-        if source_name in cards:
-            modifier = {
+        source_name = row['source_entity_name']
+        target_name = row['target_entity_name']
+        if source_name in entities:
+            modifier_data = {
                 'attack': row['attack_modifier'],
                 'defense': row['defense_modifier'],
                 'support': row['support_modifier']
             }
-            # 将影响存储在源卡牌的 'influences' 字典中
-            cards[source_name]['influences'][target_name] = modifier
+            required_scope = row['required_scope']
+            # 将影响存储为包含 modifier 和 required_scope 的字典
+            entities[source_name]['influences'][target_name].append({
+                'modifier': modifier_data,
+                'required_scope': required_scope
+            })
 
     conn.close()
-    print(f"从数据库加载了 {len(cards)} 种卡牌。")
-    return cards
+    print(f"从数据库加载了 {len(entities)} 种实体。")
+    return entities
 
 def load_hero_template(name: str) -> Optional[Dict[str, Any]]:
     """从数据库加载指定名称的英雄模板数据"""
@@ -160,19 +182,18 @@ if __name__ == '__main__':
             # return
     # --- 结束干净状态 ---
 
-    # 作为脚本运行时，初始化并填充数据库
     print("正在初始化数据库...")
-    initialize_database() # 这会创建新表
+    initialize_database()
     print("正在填充初始数据...")
-    populate_initial_data() # 这会向新表中插入数据
+    populate_initial_data()
 
     # 测试加载
     print("\n--- 测试加载数据 ---")
     try:
-        loaded_cards = load_cards_from_db()
-        print("\n加载的卡牌数据示例:")
+        loaded_entities = load_entities_from_db()
+        print("\n加载的实体数据示例:")
         import pprint
-        pprint.pprint(loaded_cards)
+        pprint.pprint(loaded_entities)
         hero1_template = load_hero_template('白板1')
         print("\n加载的英雄模板示例:")
         pprint.pprint(hero1_template)
