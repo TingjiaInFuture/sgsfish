@@ -1,92 +1,197 @@
-from game_elements import Hero, Player, get_action_entity_instance, load_action_entity_prototypes
-from game_logic import find_best_sequence, estimate_opponent_hand_probabilities, INITIAL_DECK_COMPOSITION
+import argparse
 import database
+import game_elements as ge # Use ge prefix
+from game_logic import find_best_sequence, estimate_opponent_hand_probabilities # Removed INITIAL_DECK_COMPOSITION import if not used directly here
+# Import necessary functions from training.py
+from training import training_loop, load_weights, save_weights # Removed initialize_influence_weights if only load_weights is used externally
+
+def initialize_system():
+    """Initializes database, loads entity prototypes, and prepares weights."""
+    print("--- System Initialization ---")
+    db_initialized = False
+    try:
+        # 1. Check Database and Load Base Data
+        print("Checking database and loading base data...")
+        all_entity_data = database.load_entities_from_db()
+        hero_template = database.load_hero_template('白板1') # Test load a hero
+
+        # Basic validation: Do we have entities and the test hero?
+        if not all_entity_data or not hero_template:
+             # If DB exists but data is missing, maybe repopulate? Or raise error.
+             if database.os.path.exists(database.DB_PATH):
+                 print("Database file exists but seems empty or incomplete.")
+                 raise ValueError("Database missing required entities/heroes.")
+             else:
+                 print("Database file not found.")
+                 raise FileNotFoundError("Database file missing.")
+        print("Database appears valid and contains data.")
+        db_initialized = True
+
+    except (FileNotFoundError, ValueError, database.sqlite3.OperationalError) as e:
+        print(f"Database check/load failed ({e}). Attempting to initialize/repopulate...")
+        # If DB file might be corrupt or outdated, removing it first can be safer
+        if database.os.path.exists(database.DB_PATH):
+            print(f"Removing existing database file: {database.DB_PATH}")
+            try:
+                database.os.remove(database.DB_PATH)
+            except OSError as rm_err:
+                 print(f"Warning: Could not remove old DB file: {rm_err}. Proceeding anyway.")
+
+        try:
+            database.initialize_database()
+            database.populate_initial_data()
+            db_initialized = True
+            print("Database initialized and populated successfully.")
+            # Reload data after initializing
+            all_entity_data = database.load_entities_from_db()
+            if not all_entity_data: # Check again after init
+                 raise RuntimeError("Failed to load entity data even after initialization.")
+        except Exception as init_e:
+            print(f"FATAL: Database initialization failed: {init_e}")
+            return False # Indicate failure
+
+    # 2. Load Prototypes into Game Elements (only if DB init/load succeeded)
+    if db_initialized and all_entity_data:
+        print("Loading entity prototypes...")
+        ge.load_action_entity_prototypes(all_entity_data)
+        if not ge.ACTION_ENTITY_PROTOTYPES:
+             print("FATAL: Failed to load prototypes into game elements.")
+             return False # Indicate failure
+        print("Entity prototypes loaded.")
+    else:
+        print("FATAL: Cannot load prototypes because database initialization/loading failed.")
+        return False # Indicate failure
+
+    # 3. Load or Initialize Weights (depends on prototypes being loaded)
+    print("Loading/Initializing influence weights...")
+    # load_weights now handles initialization if file not found/error
+    # It requires prototypes to be loaded first to know the structure
+    load_weights(ge.ACTION_ENTITY_PROTOTYPES)
+    if ge.influence_weights is None:
+        print("FATAL: Failed to load or initialize influence weights.")
+        return False # Indicate failure
+    print("Influence weights ready.")
+
+    print("--- System Initialization Complete ---")
+    return True # Indicate success
 
 def run_test_scenario():
-    """运行一个简单的1v1测试场景"""
+    """Runs the simple 1v1 test scenario using loaded/initialized weights."""
+    print("\n--- Running Test Scenario ---")
 
-    # --- 初始化数据库 (如果尚未完成) ---
-    try:
-        # 尝试加载实体数据，如果失败则初始化
-        all_entity_data = database.load_entities_from_db() # 更新函数调用
-        if not all_entity_data:
-             raise ValueError("未能从数据库加载实体数据")
-        load_action_entity_prototypes(all_entity_data) # 更新函数调用
-        # 尝试加载英雄数据以确认表存在
-        if not database.load_hero_template('白板1'):
-             raise ValueError("未能从数据库加载英雄模板")
-    except Exception as e:
-        print(f"初始化检查失败或数据不完整 ({e})，正在重新初始化数据库...")
-        database.initialize_database()
-        database.populate_initial_data()
-        # 重新加载数据
-        all_entity_data = database.load_entities_from_db() # 更新函数调用
-        load_action_entity_prototypes(all_entity_data) # 更新函数调用
-        if not database.load_hero_template('白板1'):
-            print("错误：数据库初始化后仍无法加载英雄模板！")
-            return
-
-    # --- 输入 ---
-    my_hero_template = database.load_hero_template("白板1")
-    opponent_hero_template = database.load_hero_template("白板2")
-
-    if not my_hero_template or not opponent_hero_template:
-        print("错误：无法从数据库加载所需的英雄模板。")
+    # Weights should have been loaded by initialize_system()
+    if ge.influence_weights is None:
+        print("CRITICAL ERROR: Influence weights not available for test scenario. Aborting.")
+        # Attempting to load again might be redundant if initialize_system failed
         return
 
-    my_current_hp = 4
-    my_hero = Hero(name=my_hero_template['name'],
-                   max_hp=my_hero_template['max_hp'],
-                   current_hp=my_current_hp)
+    # --- Input Setup ---
+    try:
+        my_hero_template = database.load_hero_template("白板1")
+        opponent_hero_template = database.load_hero_template("白板2")
+        if not my_hero_template or not opponent_hero_template:
+            raise ValueError("Required hero templates not found in database.")
 
-    my_hand_names = ["过河拆桥", "杀", "顺手牵羊"]
-    my_hand_entities = [get_action_entity_instance(name) for name in my_hand_names]
-    me = Player(name="玩家1", hero=my_hero, hand=my_hand_entities)
+        my_hero = ge.Hero(name=my_hero_template['name'], max_hp=my_hero_template['max_hp'], current_hp=4)
+        my_hand_names = ["过河拆桥", "杀", "顺手牵羊"]
+        my_hand_entities = []
+        for name in my_hand_names:
+            try:
+                my_hand_entities.append(ge.get_action_entity_instance(name))
+            except ValueError as e:
+                print(f"Warning: Could not get instance for '{name}': {e}. Skipping card.")
 
-    opponent_current_hp = 2
-    opponent_hero = Hero(name=opponent_hero_template['name'],
-                         max_hp=opponent_hero_template['max_hp'],
-                         current_hp=opponent_current_hp)
-    opponent_hand_count = 3
-    opponent = Player(name="玩家2", hero=opponent_hero, hand=[])
+        me = ge.Player(name="玩家1", hero=my_hero, hand=my_hand_entities)
 
-    print("\n--- 场景信息 ---")
+        opponent_hero = ge.Hero(name=opponent_hero_template['name'], max_hp=opponent_hero_template['max_hp'], current_hp=2)
+        opponent = ge.Player(name="玩家2", hero=opponent_hero, hand=[])
+        opponent_hand_count = 3 # Example value
+
+    except Exception as setup_e:
+        print(f"Error setting up scenario: {setup_e}")
+        return
+
+    print("\n--- Scenario Info ---")
     print(f"己方: {me.name} ({me.hero.name} {me.hero.current_hp}/{me.hero.max_hp} HP)")
-    print(f"  手牌: {[entity.name for entity in me.hand]}") # 更新变量名
+    print(f"  手牌: {[entity.name for entity in me.hand]}")
     print(f"敌方: {opponent.name} ({opponent.hero.name} {opponent.hero.current_hp}/{opponent.hero.max_hp} HP)")
     print(f"  手牌数: {opponent_hand_count}")
-    print("-" * 17)
+    print("-" * 20)
 
-    # --- 计算最佳顺序 ---
-    # 返回值类型已更改
-    best_sequence_choices, best_score = find_best_sequence(me, opponent)
+    # --- Calculate Best Sequence (Uses loaded learned weights via game_logic) ---
+    try:
+        best_sequence_choices, best_score = find_best_sequence(me, opponent)
+    except Exception as calc_e:
+        print(f"Error calculating best sequence: {calc_e}")
+        return
 
-    # --- 计算对手手牌概率 ---
-    known_entities = [entity.name for entity in me.hand] # 更新变量名
-    opponent_probs = estimate_opponent_hand_probabilities(known_entities, opponent_hand_count) # 更新参数名
+    # --- Calculate Opponent Hand Probabilities (Unchanged logic) ---
+    known_entities = [entity.name for entity in me.hand]
+    opponent_probs = estimate_opponent_hand_probabilities(known_entities, opponent_hand_count)
 
-    # --- 输出 ---
-    print("--- 推荐行动顺序 ---")
+    # --- Output ---
+    print("--- Recommended Action Sequence (Based on Current Weights) ---")
     if best_sequence_choices:
-        # 调整输出格式以显示实体名称和选择的作用域
+        # More detailed representation showing entity and chosen scope
         sequence_repr = []
         for entity, scope in best_sequence_choices:
             scope_str = f"(作用域:{scope})" if scope is not None else ""
             sequence_repr.append(f"{entity.name}{scope_str}")
-        print(f"序列: {' -> '.join(sequence_repr)}")
-        print(f"预期总得分: {best_score:.2f}")
+        print(f"Sequence: {' -> '.join(sequence_repr)}")
+        print(f"Expected Score: {best_score:.4f}") # Show more precision
     else:
-        print("无推荐行动")
+        print("No recommended actions.")
     print("-" * 20)
 
-    print("--- 敌方手牌概率估计 (基于简化模型) ---")
+    print("--- Opponent Hand Probability Estimate ---")
     if opponent_probs:
         sorted_probs = sorted(opponent_probs.items(), key=lambda item: item[1], reverse=True)
-        for entity_name, prob in sorted_probs: # 更新变量名
+        for entity_name, prob in sorted_probs:
             print(f"  {entity_name}: {prob:.2%}")
     else:
-        print("无法估计概率 (牌堆不足或对手无手牌)")
+        print("Cannot estimate probabilities (check deck/opponent hand size).")
     print("-" * 38)
 
+
 if __name__ == "__main__":
-    run_test_scenario()
+    parser = argparse.ArgumentParser(description="SGS AI - Train influence weights or Run test scenario.")
+    parser.add_argument('mode', choices=['train', 'run'], help="Mode: 'train' the weights or 'run' the test scenario.")
+    parser.add_argument('--epochs', type=int, default=20, help="Number of training epochs (if mode is train).")
+    parser.add_argument('--lr', type=float, default=0.01, help="Learning rate (if mode is train).")
+    parser.add_argument('--batch_size', type=int, default=16, help="Batch size for training.")
+    parser.add_argument('--dummy_samples', type=int, default=200, help="Number of dummy samples to generate for training.")
+
+    args = parser.parse_args()
+
+    # --- Perform Initialization Once ---
+    if not initialize_system():
+         print("System initialization failed. Exiting.")
+         exit(1)
+    # --------------------------------
+
+    # Ensure prototypes are loaded before proceeding
+    if not ge.ACTION_ENTITY_PROTOTYPES:
+         print("Fatal Error: Entity prototypes failed to load after initialization. Exiting.")
+         exit(1)
+
+    if args.mode == 'train':
+        print("\n=== Starting Training Mode ===")
+        # Training loop handles weight loading/initialization internally via load_weights
+        training_loop(
+            prototypes=ge.ACTION_ENTITY_PROTOTYPES, # Pass loaded prototypes
+            num_epochs=args.epochs,
+            learning_rate=args.lr,
+            batch_size=args.batch_size,
+            num_dummy_samples=args.dummy_samples
+        )
+        print("Training finished. Weights saved to influence_weights.pth (if successful).")
+
+    elif args.mode == 'run':
+        print("\n=== Starting Run Mode ===")
+        # Weights should already be loaded by initialize_system()
+        if ge.influence_weights is None:
+             print("Error: Weights not loaded correctly before running scenario. Check initialization.")
+        else:
+             run_test_scenario()
+
+# --- END OF FILE main.py ---

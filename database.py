@@ -13,11 +13,11 @@ def get_db_connection():
     return conn
 
 def initialize_database():
-    """初始化数据库表，支持 ActionEntity 的 scope 和 influence 的 required_scope"""
+    """初始化数据库表，影响表不再存储具体修正值"""
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 更新 entities 表，添加 scope 列 (存储 JSON 列表)
+    # entities 表保持不变 (除了 scope 列)
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS entities (
         name TEXT PRIMARY KEY,
@@ -28,21 +28,19 @@ def initialize_database():
         response_suit INTEGER,
         response_rank_start INTEGER,
         response_rank_end INTEGER,
-        scope TEXT -- 新增: 可选作用域 (存储为 JSON 字符串, e.g., '[1, 2, 3]')
+        scope TEXT -- 可选作用域 (存储为 JSON 字符串)
     )
     ''')
 
-    # 更新 entity_influences 表，添加 required_scope 列
+    # entity_influences 现在只定义关系和范围要求
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS entity_influences (
         influence_id INTEGER PRIMARY KEY AUTOINCREMENT,
         source_entity_name TEXT NOT NULL,
         target_entity_name TEXT NOT NULL,
-        attack_modifier REAL DEFAULT 0.0,
-        defense_modifier REAL DEFAULT 0.0,
-        support_modifier REAL DEFAULT 0.0,
-        required_scope INTEGER, -- 新增: 影响生效所需的作用域
+        required_scope INTEGER, -- 影响生效所需的作用域
         FOREIGN KEY (source_entity_name) REFERENCES entities (name)
+        -- Modifiers (attack_modifier, etc.) are removed as they are now learnable weights
     )
     ''')
 
@@ -56,31 +54,28 @@ def initialize_database():
 
     conn.commit()
     conn.close()
-    print("数据库表已初始化/更新。")
+    print("数据库表已初始化/更新 (影响表不含修正值)。")
 
 def populate_initial_data():
-    """填充初始数据，包含 scope 和 required_scope"""
+    """填充初始数据，影响数据不含具体修正值"""
     conn = get_db_connection()
     cursor = conn.cursor()
 
     # (name, attack, defense, support, timing, response_suit, response_rank_start, response_rank_end, scope_json)
     entities_data = [
-        ('杀', 1.0, 0.0, 0.0, 0, None, None, None, None), # 无特定可选作用域
-        ('过河拆桥', 0.0, 0.0, 1.0, 0, None, None, None, json.dumps([1, 2, 3])), # 可选手牌(1), 装备(2), 判定(3)
-        ('顺手牵羊', 0.0, 0.0, 1.0, 0, None, None, None, json.dumps([1, 2])), # 可选手牌(1), 装备(2)
-        ('闪电', 0.0, 0.0, 0.0, 2, 1, 2, 9, None), # 判定牌，无可选作用域
-        ('闪', 0.0, 1.0, 0.0, None, None, None, None, None), # 响应牌
-        ('桃', 0.0, 0.0, 1.0, 0, None, None, None, None), # 出牌阶段可用
+        ('杀', 1.0, 0.0, 0.0, 0, None, None, None, None),
+        ('过河拆桥', 0.0, 0.0, 1.0, 0, None, None, None, json.dumps([1, 2, 3])),
+        ('顺手牵羊', 0.0, 0.0, 1.0, 0, None, None, None, json.dumps([1, 2])),
+        ('闪电', 0.0, 0.0, 0.0, 2, 1, 2, 9, None),
+        ('闪', 0.0, 1.0, 0.0, None, None, None, None, None),
+        ('桃', 0.0, 0.0, 1.0, 0, None, None, None, None),
     ]
 
-    # (source, target, atk_mod, def_mod, sup_mod, required_scope)
+    # (source, target, required_scope) - Modifiers removed
     influences_data = [
-        # 过拆作用于手牌(1)时，增加后续杀的攻击
-        ('过河拆桥', '杀', 1.0, 0.0, 0.0, 1),
-        # 过拆作用于装备区(2)时，增加后续顺手的辅助
-        ('过河拆桥', '顺手牵羊', 0.0, 0.0, 1.0, 2),
-        # 顺手作用于手牌(1)时，增加后续杀的攻击
-        ('顺手牵羊', '杀', 1.0, 0.0, 0.0, 1),
+        ('过河拆桥', '杀', 1),
+        ('过河拆桥', '顺手牵羊', 2),
+        ('顺手牵羊', '杀', 1),
     ]
 
     heroes_data = [
@@ -97,12 +92,18 @@ def populate_initial_data():
         cursor.executemany('INSERT OR IGNORE INTO heroes (name, max_hp) VALUES (?, ?)', heroes_data)
         print("Heroes inserted.")
 
-        print("Inserting influences...")
-        cursor.executemany('INSERT INTO entity_influences (source_entity_name, target_entity_name, attack_modifier, defense_modifier, support_modifier, required_scope) VALUES (?, ?, ?, ?, ?, ?)', influences_data)
-        print("Influences inserted.")
+        # Clear existing influences before inserting new ones to avoid duplicates if script is run multiple times
+        # This is important if populate_initial_data is called after schema changes or multiple times
+        print("Clearing old influences (if any)...")
+        cursor.execute('DELETE FROM entity_influences')
+        print("Cleared old influences.")
+
+        print("Inserting influence relationships...")
+        cursor.executemany('INSERT INTO entity_influences (source_entity_name, target_entity_name, required_scope) VALUES (?, ?, ?)', influences_data)
+        print("Influence relationships inserted.")
 
         conn.commit()
-        print("初始实体、英雄和影响数据已填充/更新。")
+        print("初始实体、英雄和影响关系数据已填充/更新。")
     except sqlite3.Error as e:
         print(f"填充数据时发生数据库错误: {e}")
         conn.rollback()
@@ -113,7 +114,7 @@ def populate_initial_data():
         conn.close()
 
 def load_entities_from_db() -> Dict[str, Any]:
-    """从数据库加载所有实体及其影响 (包含 scope 和 required_scope)"""
+    """从数据库加载所有实体及其影响关系 (不含修正值)"""
     entities = {}
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -124,7 +125,7 @@ def load_entities_from_db() -> Dict[str, Any]:
     for row in entity_rows:
         entities[row['name']] = {
             'attributes': {'attack': row['attack'], 'defense': row['defense'], 'support': row['support']},
-            'influences': defaultdict(list), # 初始化影响字典 (使用 defaultdict)
+            'potential_influences': defaultdict(list), # 重命名: 存储潜在影响目标和范围
             'timing': row['timing'],
             'response_suit': row['response_suit'],
             'response_rank_start': row['response_rank_start'],
@@ -132,30 +133,24 @@ def load_entities_from_db() -> Dict[str, Any]:
             'scope': row['scope'] # Load scope as JSON string initially
         }
 
-    # 加载影响，包含 required_scope
+    # 加载影响关系 (不含修正值)
     cursor.execute('''
-        SELECT source_entity_name, target_entity_name, attack_modifier, defense_modifier, support_modifier, required_scope
+        SELECT source_entity_name, target_entity_name, required_scope
         FROM entity_influences
     ''')
     influence_rows = cursor.fetchall()
     for row in influence_rows:
         source_name = row['source_entity_name']
         target_name = row['target_entity_name']
+        required_scope = row['required_scope']
         if source_name in entities:
-            modifier_data = {
-                'attack': row['attack_modifier'],
-                'defense': row['defense_modifier'],
-                'support': row['support_modifier']
-            }
-            required_scope = row['required_scope']
-            # 将影响存储为包含 modifier 和 required_scope 的字典
-            entities[source_name]['influences'][target_name].append({
-                'modifier': modifier_data,
-                'required_scope': required_scope
-            })
+            # 存储目标实体名称和所需的作用域列表
+            entities[source_name]['potential_influences'][target_name].append(required_scope)
+            # Example: entities['过河拆桥']['potential_influences']['杀'] = [1]
+            # Example: entities['过河拆桥']['potential_influences']['顺手牵羊'] = [2]
 
     conn.close()
-    print(f"从数据库加载了 {len(entities)} 种实体。")
+    print(f"从数据库加载了 {len(entities)} 种实体的基础信息和影响关系。")
     return entities
 
 def load_hero_template(name: str) -> Optional[Dict[str, Any]]:
@@ -191,9 +186,10 @@ if __name__ == '__main__':
     print("\n--- 测试加载数据 ---")
     try:
         loaded_entities = load_entities_from_db()
-        print("\n加载的实体数据示例:")
+        print("\n加载的实体数据示例 (仅含关系):")
         import pprint
-        pprint.pprint(loaded_entities)
+        # Convert defaultdict back to dict for cleaner printing if needed
+        pprint.pprint({k: dict(v) for k, v in loaded_entities.items()})
         hero1_template = load_hero_template('白板1')
         print("\n加载的英雄模板示例:")
         pprint.pprint(hero1_template)

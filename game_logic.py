@@ -1,31 +1,26 @@
 import itertools
-from typing import List, Tuple, Union, Dict, DefaultDict, Optional
+from typing import List, Tuple, Dict, Optional, Union # Add Union
 from collections import defaultdict
-from game_elements import ActionEntity, AttributeSet, Player, Hero, load_action_entity_prototypes, get_action_entity_instance
-from database import load_entities_from_db
+import torch # Need torch for tensor operations
 
-# --- 全局实体定义 (从数据库加载) ---
-try:
-    print("正在从数据库加载实体数据...")
-    all_entity_data = load_entities_from_db()
-    load_action_entity_prototypes(all_entity_data)
-except Exception as e:
-    print(f"错误：无法从数据库加载实体数据！请确保数据库已初始化。错误：{e}")
-    # exit()
+# Use ge prefix for clarity and access to global weights/prototypes
+import game_elements as ge
+from game_elements import ActionEntity, AttributeSet, Player, Hero, TensorAttributeSet
+# Import function to get learned modifiers from training module
+from training import get_influence_modifier_tensor
 
-# --- 初始牌堆定义 (用于概率模型) ---
+# --- Probability Model and Deck (Keep as is) ---
 INITIAL_DECK_COMPOSITION = {
     "杀": 15,
     "过河拆桥": 5,
     "顺手牵羊": 5,
     "闪": 10,
     "桃": 5,
-    "闪电": 1, # 添加闪电到概率模型
+    "闪电": 1,
 }
 
-# --- 概率模型 ---
 def estimate_opponent_hand_probabilities(
-    known_entities: List[str], # 更新参数名
+    known_entities: List[str],
     opponent_hand_size: int,
     initial_deck: Dict[str, int] = INITIAL_DECK_COMPOSITION
 ) -> Dict[str, float]:
@@ -33,7 +28,7 @@ def estimate_opponent_hand_probabilities(
     根据已知实体和对手手牌数，估计对手手牌中各种实体的概率
     """
     remaining_deck = initial_deck.copy()
-    for entity_name in known_entities: # 更新变量名
+    for entity_name in known_entities:
         if entity_name in remaining_deck and remaining_deck[entity_name] > 0:
             remaining_deck[entity_name] -= 1
 
@@ -43,14 +38,15 @@ def estimate_opponent_hand_probabilities(
     if total_remaining_cards <= 0 or opponent_hand_size <= 0:
         return dict(probabilities)
 
-    for entity_name, count in remaining_deck.items(): # 更新变量名
+    for entity_name, count in remaining_deck.items():
         if count > 0:
             proportion = count / total_remaining_cards
             probabilities[entity_name] = proportion
 
     return dict(probabilities)
 
-# --- 权重计算 ---
+
+# --- Weight Calculation (Keep as is) ---
 def calculate_weights(player_hp_ratio: float, opponent_hp_ratio: float) -> Dict[str, float]:
     """根据双方血量计算属性权重"""
     attack_weight = 1.0 + (1.0 - opponent_hp_ratio) # 敌方血少，攻击权重高
@@ -58,86 +54,136 @@ def calculate_weights(player_hp_ratio: float, opponent_hp_ratio: float) -> Dict[
     support_weight = 1.0 # 辅助权重暂时固定
     return {"attack": attack_weight, "defense": defense_weight, "support": support_weight}
 
-# --- 行动评估 (考虑影响) ---
-# 更新签名以包含 chosen_scope (即使当前未使用)
+# --- Action Evaluation (Handles TensorAttributeSet from learned weights) ---
 def evaluate_action(
     action: ActionEntity,
     weights: Dict[str, float],
-    active_influence_modifier: AttributeSet = AttributeSet(),
-    chosen_scope: Optional[int] = None # 新增参数
+    # Modifier might be TensorAttributeSet during runtime if derived from learned weights
+    active_influence_modifier: Union[AttributeSet, TensorAttributeSet] = TensorAttributeSet(), # Default to empty Tensor set
+    chosen_scope: Optional[int] = None # Keep chosen_scope, though not directly used in this func
 ) -> float:
-    """评估单个行动的价值，应用传入的影响修改"""
-    # 注意：当前评估逻辑不直接使用 action.scope 或 chosen_scope
-    # Scope 主要影响 find_best_sequence 中的影响应用
-    effective_attributes = action.base_attributes + active_influence_modifier
-    score = (effective_attributes.attack * weights.get("attack", 1.0) +
-             effective_attributes.defense * weights.get("defense", 1.0) +
-             effective_attributes.support * weights.get("support", 1.0))
+    """
+    评估单个行动的价值。
+    如果 active_influence_modifier 是 TensorAttributeSet，则从中提取数值。
+    """
+    # Base attributes are always floats (AttributeSet)
+    base_attrs = action.base_attributes
+
+    # Add base attributes and the modifier. This works if modifier is AttributeSet or TensorAttributeSet
+    # The result will be AttributeSet or TensorAttributeSet
+    effective_attributes = base_attrs + active_influence_modifier
+
+    # Extract float values for score calculation
+    if isinstance(effective_attributes, TensorAttributeSet):
+        # Detach tensor from graph and get Python float value
+        atk = effective_attributes.attack.detach().item()
+        dfs = effective_attributes.defense.detach().item()
+        sup = effective_attributes.support.detach().item()
+    elif isinstance(effective_attributes, AttributeSet):
+         atk = effective_attributes.attack
+         dfs = effective_attributes.defense
+         sup = effective_attributes.support
+    else:
+        # Fallback, should not happen with current __add__ implementations
+        atk, dfs, sup = 0.0, 0.0, 0.0
+        print(f"Warning: Unexpected type for effective_attributes in evaluate_action: {type(effective_attributes)}")
+
+    # Calculate score using float values
+    score = (atk * weights.get("attack", 1.0) +
+             dfs * weights.get("defense", 1.0) +
+             sup * weights.get("support", 1.0))
+
     return score
 
-# --- 最佳序列查找 (评估不同作用域) ---
+# --- Best Sequence Finder (Uses LEARNED weights) ---
 def find_best_sequence(
     player: Player,
     opponent: Player
-) -> Tuple[List[Tuple[ActionEntity, Optional[int]]], float]: # 返回值变为 (动作选择列表, 分数)
+) -> Tuple[List[Tuple[ActionEntity, Optional[int]]], float]:
     """
-    查找当前玩家的最佳行动顺序，考虑实体之间的影响及其作用域要求。
-    会评估具有不同可选作用域的动作的各种选择。
-    注意：这会显著增加计算复杂度。
+    查找当前玩家的最佳行动顺序，使用从全局 ge.influence_weights 获取的影响修正值。
     """
-    weights = calculate_weights(player.hero.get_hp_ratio(), opponent.hero.get_hp_ratio())
+    # Check if weights are loaded/initialized. This should be handled by main.py ideally.
+    if ge.influence_weights is None:
+        print("Warning: ge.influence_weights is None in find_best_sequence. Influence modifiers will be zero.")
+        # As a safety measure, maybe initialize here? Or rely on main.py's init.
+        # For now, proceed assuming zero influence if not loaded.
 
-    # 1. 生成所有可能的 "动作选择" (实体, 选定作用域)
+    context_weights = calculate_weights(player.hero.get_hp_ratio(), opponent.hero.get_hp_ratio())
+
+    # 1. Generate all possible "action choices" (entity, chosen_scope) from hand
     possible_action_choices: List[Tuple[ActionEntity, Optional[int]]] = []
     for entity in player.hand:
         if entity.scope:
+            # If scopable, create choices for each scope option
             for scope_option in entity.scope:
                 possible_action_choices.append((entity, scope_option))
+            # Optional: Also consider using the scopable card without a specific scope?
+            # If the game allows using '过河拆桥' without specifying target type initially.
+            # possible_action_choices.append((entity, None)) # Add this if applicable
         else:
-            # 没有可选作用域的动作
+            # If not scopable, the only choice is the entity itself with None scope
             possible_action_choices.append((entity, None))
 
     best_sequence_choices: List[Tuple[ActionEntity, Optional[int]]] = []
     max_score = -float('inf')
 
-    # 2. 对 "动作选择" 进行排列组合
-    # 遍历所有可能的序列长度 k
-    for k in range(len(possible_action_choices) + 1):
-        # 遍历长度为 k 的所有排列
+    # 2. Iterate through permutations of possible action choices
+    # Consider permutations up to the number of choices available
+    max_k = len(possible_action_choices)
+    for k in range(max_k + 1): # Check sequences of length 0 to max_k
+        # Use itertools.permutations to get sequences of length k
         for sequence_tuple in itertools.permutations(possible_action_choices, k):
             current_sequence_choices = list(sequence_tuple)
             current_total_score = 0.0
-            # 存储每个位置生效的影响修改器
-            influences_in_sequence: Dict[int, AttributeSet] = defaultdict(AttributeSet)
+            # Use TensorAttributeSet to accumulate modifiers, even if weights aren't loaded (defaults to 0 tensor)
+            influences_in_sequence: Dict[int, TensorAttributeSet] = defaultdict(TensorAttributeSet)
 
-            # 第一遍：计算影响 (基于选定的作用域)
-            for i, (action_i, chosen_scope_i) in enumerate(current_sequence_choices):
-                if action_i.influences:
-                    # 遍历 action_i 能影响的目标实体名称
-                    for target_entity_name, influence_rules in action_i.influences.items():
-                        # 遍历该目标实体的所有影响规则 (modifier, required_scope)
-                        for modifier, required_scope in influence_rules:
-                            # 检查影响是否适用于当前动作选择的作用域
-                            if required_scope is None or required_scope == chosen_scope_i:
-                                # 查找序列中 action_i 之后出现的第一个 target_entity_name
-                                for j in range(i + 1, len(current_sequence_choices)):
-                                    action_j, _ = current_sequence_choices[j] # 获取下一个动作的实体
-                                    if action_j.name == target_entity_name:
-                                        # 将影响累加到 action_j 的位置上
-                                        influences_in_sequence[j] += modifier
-                                        # 假设一个影响规则只作用于后续第一个匹配的牌 (简化)
-                                        break # 处理完这个 target_entity_name 的这个规则，继续下一个规则或目标
+            # --- First pass: Calculate influence using LEARNED weights ---
+            if ge.influence_weights is not None: # Only calculate if weights are available
+                for i, (action_i, chosen_scope_i) in enumerate(current_sequence_choices):
+                    # Check potential influences defined for action_i in prototypes
+                    for target_entity_name, possible_scopes in action_i.potential_influences.items():
+                         # Check each scope rule defined for this source-target pair
+                         for required_scope in possible_scopes:
+                              # Does the rule's required scope match the scope chosen for action_i?
+                              if required_scope is None or required_scope == chosen_scope_i:
+                                  # --- Get modifier tensor from LEARNED WEIGHTS ---
+                                  modifier_tensor = get_influence_modifier_tensor(
+                                      action_i.name, target_entity_name, required_scope
+                                  )
+                                  # --- End of learned weight usage ---
 
-            # 第二遍：评估序列的总分，应用计算出的影响
+                                  if modifier_tensor is not None:
+                                      # Find the first subsequent action matching the target name
+                                      for j in range(i + 1, len(current_sequence_choices)):
+                                          action_j, _ = current_sequence_choices[j]
+                                          if action_j.name == target_entity_name:
+                                              # Accumulate the tensor modifier
+                                              influences_in_sequence[j] += modifier_tensor
+                                              # Assumption: influence applies only to the first match
+                                              break # Move to the next rule/target
+
+            # --- Second pass: Evaluate sequence score using accumulated modifiers ---
             for i, (action, chosen_scope) in enumerate(current_sequence_choices):
+                # Get the accumulated modifier (TensorAttributeSet, possibly all zeros)
                 modifier_for_this_action = influences_in_sequence[i]
-                # 将 chosen_scope 传递给评估函数
-                action_score = evaluate_action(action, weights, modifier_for_this_action, chosen_scope)
+                # evaluate_action handles TensorAttributeSet modifier and returns float score
+                action_score = evaluate_action(action, context_weights, modifier_for_this_action, chosen_scope)
                 current_total_score += action_score
 
-            # 更新最佳序列
+            # Update best sequence found so far
             if current_total_score > max_score:
                 max_score = current_total_score
                 best_sequence_choices = current_sequence_choices
 
     return best_sequence_choices, max_score
+
+# --- Remove prototype loading from here; it's handled in main.py ---
+# try:
+#     print("Game Logic: Loading entity data for prototypes...")
+#     import database # Local import for this block if needed, avoid top-level if circular
+#     all_entity_data = database.load_entities_from_db()
+#     ge.load_action_entity_prototypes(all_entity_data)
+# except Exception as e:
+#     print(f"Game Logic Error: Failed to load entity data on import: {e}")
